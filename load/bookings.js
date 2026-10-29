@@ -23,11 +23,22 @@ const API_1 = 'http://f26-lab09-api-1:8080';
 const API_2 = 'http://f26-lab09-api-2:8080';
 
 export default function () {
-  // Same room and exact same future time interval
+  // Generate a slot within valid limits:
+  // - Advance window: 2 to 10 days ahead (STUDY_ROOM allows up to 14 days)
+  // - Opening hours: between 08:00 and 18:00 UTC (opening window is 06:00 to 22:00 UTC)
+  // This allows repeated runs on the same containers to each test a fresh slot
+  const dayOffset = Math.floor(Math.random() * 8) + 2;
+  const hour = String(Math.floor(Math.random() * 10) + 8).padStart(2, '0');
+  const nextHour = String(parseInt(hour, 10) + 1).padStart(2, '0');
+  const d = new Date(Date.now() + dayOffset * 24 * 60 * 60 * 1000);
+  const dateStr = d.toISOString().split('T')[0];
+  const start = __ENV.START || `${dateStr}T${hour}:00:00Z`;
+  const end = __ENV.END || `${dateStr}T${nextHour}:00:00Z`;
+
   const bookingPayload = {
     roomId: 'r-1',
-    start: '2026-10-31T14:00:00Z',
-    end: '2026-10-31T15:00:00Z',
+    start: start,
+    end: end,
     attendees: '2',
   };
 
