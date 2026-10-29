@@ -184,17 +184,32 @@ One thing your agent proposed that you checked:
 
 Take one problem from Milestone 1 or 2 and propose the boundary that fixes it.
 
-**The boundary.** The port, what it promises, and which side implements it. Say what
-moves and what stays.
+**Problem chosen:** Finding 2 (Concurrent duplicate bookings across replicas).
+- *Location and mechanism:* In `core-domain/src/main/java/edu/cmu/cs214/campusreserve/core/service/BookingService.java` (lines 112–125), `BookingService.requestBooking()` executes a non-atomic read-check-write sequence: it queries `bookings.findActiveByRoom(roomId)`, runs in-memory `conflictChecker.hasConflict(...)`, and then calls `bookings.save(booking)`. When CampusReserve runs as multiple copies behind a load balancer, each copy operates on its own private `InMemoryBookingStore` map without synchronization, allowing concurrent or interleaved requests for the same room and slot to both confirm and persist.
 
-**Who owns the data.** Name the module that owns the data this boundary is about,
-and say what everybody else is allowed to do with it.
+**The boundary.**
+- **The port:** Add `boolean saveIfFree(Booking booking)` to `core/ports/BookingStore.java` in `core-domain`, replacing the unchecked `void save(Booking booking)` on the reservation creation path.
+- **What it promises:** The port promises linearizable, atomic conflict detection and reservation: it checks for active conflicting bookings on `booking.roomId()` over `booking.interval()` and persists the booking if and only if no conflict exists in a single atomic transaction, returning `true`. If an overlapping active booking already exists, it aborts without persisting and returns `false`.
+- **Which side implements it:** `storage` implements it. In a multi-copy production deployment, a shared `JdbcBookingStore` enforces this atomically using a shared relational database transaction with exclusion constraints (e.g., PostgreSQL `EXCLUDE USING gist (room_id WITH =, interval_range WITH &&)`). For tests and local CLI, `InMemoryBookingStore` implements it using an atomic `compute()` or synchronized lock over the room's booking list.
+- **What moves and what stays:**
+  - *What moves:* Authoritative write-time conflict detection moves across the port boundary into `storage` (enforced at the transactional datastore level).
+  - *What stays:* Business validation rules (room eligibility, duration limits, 15-minute slot alignment, opening hours, room capacity, advance booking limits, and user active booking caps) stay in `core-domain` (`BookingService`, `BookingRules`, `BookingPolicy`). Preliminary availability reads for user UI queries also stay in `core-domain` (`AvailabilityService`).
 
-**The one invariant that must not cross.** Exactly one, stated so that a reader
-can tell whether a given piece of code violates it.
+**Who owns the data.**
+`storage` owns the persistence of booking records and the definitive concurrency control over room calendars. `core-domain` is allowed to query active bookings and request atomic reservations via `BookingStore`. All entry points (`http-api`, `cli`) and other modules (`billing`, `analytics`) are forbidden from mutating booking state directly and may only read or create bookings through `BookingService` in `core-domain`.
 
-**What the boundary costs.** An interface to keep, a second implementation to
-maintain, a performance argument to have again. Include what it leaves unfixed.
+**The one invariant that must not cross.**
+"No two stored bookings with status `CONFIRMED` for the same `roomId` may have overlapping time intervals (`booking1.interval().overlaps(booking2.interval()) == true`)."
 
-Feel free to read the appendix on what a good proposal looks like in the Lab 3 handout
-before you write this section.
+**What the boundary costs.**
+- **Interface & code changes:** Modifies `core/ports/BookingStore.java`. `BookingService.requestBooking()` must be rewritten to branch on `bookings.saveIfFree(booking)` (routing to waitlist on `false`), abandoning `ARCHITECTURE.md`'s assumption that swapping in-memory stores for durable ones requires no changes to `core-domain`.
+- **Maintenance of a second implementation:** Requires building and maintaining a durable SQL store (`JdbcBookingStore`) with schema migrations, connection pooling, network timeout handling, and failure retries alongside `InMemoryBookingStore`.
+- **Priced performance tradeoff:**
+  - *Latency:* Replaces sub-microsecond in-memory map access with 5–20ms network round trips to a shared database server.
+  - *Throughput & Contention:* Under high concurrency (e.g., student rush when booking opens for the semester), transactional serialization on the same room forces requests into lock queues, capping throughput at the database's write rate.
+- **What it leaves unfixed:**
+  - *Token authorization failure (Finding 1):* Replicas still mint bearer tokens in local `accounts:TokenService` memory; requests routed across copies will continue to fail with 401 Unauthorized until session state is externalized or signed (e.g., via JWTs or Redis).
+  - *Waitlist partitioning:* `WaitlistStore` remains in local replica memory; cancellations on Copy 1 will not promote waiters queued on Copy 2.
+  - *Event log divergence:* Events continue to be appended to replica-local event logs, fragmenting the analytics trail unless `EventLogWriter` is also centralized.
+- **Condition that would flip this decision:**
+  I would prefer this atomic reservation boundary if CampusReserve must scale horizontally as multiple active write replicas to handle high user loads without double-booking rooms. If the system's write traffic is modest enough for a single primary instance with read replicas, or if deployments remain single-process, I would instead reject the boundary change, run a single active write copy behind the proxy (with sticky sessions for tokens), and avoid the interface churn and latency cost of transactional exclusion constraints entirely.
